@@ -45,6 +45,14 @@ struct AssignmentResult {
     quic_connection: quinn::Connection,
 }
 
+fn is_normal_client_shutdown(error: &quincy::QuincyError) -> bool {
+    // ClientRelayer closes with application code 1 on an orderly shutdown.
+    matches!(
+        error,
+        quincy::QuincyError::Quic(quincy::error::QuicError::ApplicationError { error_code: 1 })
+    )
+}
+
 /// Time allowed for a QUIC handshake to complete before the attempt is dropped.
 ///
 /// A half-open connection attempt (a client that sent an Initial and then went
@@ -366,10 +374,17 @@ impl QuincyServer {
                         });
                     }
 
-                    warn!(
-                        "Connection with client {} (user '{username}') has encountered an error: {err}",
-                        client_address.addr()
-                    );
+                    if is_normal_client_shutdown(&err) {
+                        debug!(
+                            "Client {} (user '{username}') disconnected normally",
+                            client_address.addr()
+                        );
+                    } else {
+                        warn!(
+                            "Connection with client {} (user '{username}') has encountered an error: {err}",
+                            client_address.addr()
+                        );
+                    }
                 }
 
                 // Shutdown
@@ -655,6 +670,54 @@ async fn relay_unisolated(
                 // Send the packet to the TUN interface
                 None => interface.write_packet(packet).await?,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::is_normal_client_shutdown;
+    use quincy::QuincyError;
+    use quincy::error::QuicError;
+    use quinn::{ApplicationClose, ConnectionError, ReadError, SendDatagramError, WriteError};
+
+    fn peer_close(code: u32) -> ConnectionError {
+        ConnectionError::ApplicationClosed(ApplicationClose {
+            error_code: code.into(),
+            reason: bytes::Bytes::new(),
+        })
+    }
+
+    #[test]
+    fn normal_client_shutdown_is_recognized_on_all_io_paths() {
+        let errors = [
+            QuincyError::from(peer_close(1)),
+            QuincyError::from(ReadError::ConnectionLost(peer_close(1))),
+            QuincyError::from(WriteError::ConnectionLost(peer_close(1))),
+            QuincyError::from(SendDatagramError::ConnectionLost(peer_close(1))),
+        ];
+        for error in errors {
+            assert!(is_normal_client_shutdown(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn connection_failures_are_not_normal_client_shutdowns() {
+        let errors = [
+            QuincyError::from(peer_close(0)),
+            QuincyError::from(peer_close(2)),
+            QuincyError::from(peer_close(u32::MAX)),
+            QuincyError::from(ConnectionError::TimedOut),
+            QuincyError::from(ConnectionError::Reset),
+            QuincyError::from(ConnectionError::LocallyClosed),
+            QuincyError::Quic(QuicError::TransportError { error_code: 1 }),
+            QuincyError::from(ReadError::Reset(1_u32.into())),
+            QuincyError::from(WriteError::Stopped(1_u32.into())),
+            QuincyError::from(SendDatagramError::TooLarge),
+            QuincyError::system("Egress queue has been closed"),
+        ];
+        for error in errors {
+            assert!(!is_normal_client_shutdown(&error), "{error:?}");
         }
     }
 }
