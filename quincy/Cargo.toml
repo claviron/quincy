@@ -1,8 +1,8 @@
 [package]
-name = "quincy"
-description = "QUIC-based VPN - Core library"
-readme = "../README.md"
-version.workspace = true
+name = "quincy-forked"
+description = "Unofficial Quincy fork: QUIC VPN core for host-managed runtimes"
+version = "0.0.1"
+publish = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true

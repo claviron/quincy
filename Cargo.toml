@@ -4,21 +4,22 @@ resolver = "2"
 
 [workspace.package]
 version = "3.1.0"
-authors = ["Jakub Kubík <jakub.kubik.it@protonmail.com>"]
+publish = false
+authors = ["Jakub Kubík <jakub.kubik.it@protonmail.com>", "ilker Arabaci <iadev09@claviron.dev>"]
 license = "AGPL-3.0-or-later"
 readme = "README.md"
 edition = "2024"
 rust-version = "1.88"
 homepage = "https://github.com/quincy-rs/quincy"
-repository = "https://github.com/quincy-rs/quincy"
+repository = "https://github.com/claviron/quincy"
 keywords = ["vpn", "quic", "tunnel", "networking", "tokio"]
 categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 # Internal crates
-quincy = { path = "quincy", version = "3.1.0" }
+quincy = { package = "quincy-forked", path = "quincy", version = "0.0.1" }
 quincy-client = { path = "quincy-client", version = "3.1.0" }
-quincy-server = { path = "quincy-server", version = "3.1.0" }
+quincy-server = { package = "quincy-server-forked", path = "quincy-server", version = "0.0.1" }
 
 # Quinn
 quinn = { version = "^0.11.12", default-features = false, features = [

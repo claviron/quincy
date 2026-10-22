@@ -1,5 +1,6 @@
 [package]
 name = "quincy-tests"
+publish.workspace = true
 description = "Integration tests for Quincy VPN"
 version.workspace = true
 authors.workspace = true

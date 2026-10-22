@@ -1,8 +1,8 @@
 [package]
-name = "quincy-server"
-description = "QUIC-based VPN - Server binaries"
-readme = "../README.md"
-version.workspace = true
+name = "quincy-server-forked"
+description = "Unofficial Quincy server fork with lifecycle observers and host-owned shutdown"
+version = "0.0.1"
+publish = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -11,6 +11,10 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lib]
+name = "quincy_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "quincy-server"

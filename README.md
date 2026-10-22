@@ -1,4 +1,15 @@
 # Quincy
+
+This is an unofficial fork of [Quincy](https://github.com/quincy-rs/quincy),
+based on upstream 3.1.0, with host-owned shutdown and connection lifecycle hooks.
+Its separately named registry packages are [quincy-forked](quincy/README.md) and
+[quincy-server-forked](quincy-server/README.md), version 0.0.1. The Rust import
+names remain `quincy` and `quincy_server`. Licensing remains AGPL-3.0-or-later.
+
+Only these two fork packages are published from this workspace. The upstream
+installation and client/GUI documentation below is retained for reference;
+those tools are not fork releases.
+
 [![Crates.io](https://img.shields.io/crates/v/quincy.svg)](https://crates.io/crates/quincy)
 [![GHCR](https://img.shields.io/badge/GHCR-quincy-blue?logo=docker)](https://github.com/quincy-rs/quincy/pkgs/container/quincy)
 [![Documentation](https://docs.rs/quincy/badge.svg)](https://docs.rs/quincy/)

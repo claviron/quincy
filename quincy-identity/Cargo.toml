@@ -1,5 +1,6 @@
 [package]
 name = "quincy-identity"
+publish.workspace = true
 description = "QUIC-based VPN - Identity management tool"
 readme = "../README.md"
 version.workspace = true

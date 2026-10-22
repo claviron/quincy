@@ -3979,8 +3979,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "quincy"
+name = "quincy-client"
 version = "3.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "ipnet",
+ "quincy-forked",
+ "quinn",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "quincy-forked"
+version = "0.0.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -4013,19 +4026,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quincy-client"
-version = "3.1.0"
-dependencies = [
- "clap",
- "futures",
- "ipnet",
- "quincy",
- "quinn",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "quincy-gui"
 version = "3.1.0"
 dependencies = [
@@ -4035,8 +4035,8 @@ dependencies = [
  "ipnet",
  "nu-ansi-term",
  "privesc",
- "quincy",
  "quincy-client",
+ "quincy-forked",
  "regex",
  "serde",
  "serde_json",
@@ -4053,7 +4053,7 @@ version = "3.1.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
- "quincy",
+ "quincy-forked",
  "rand_core 0.6.4",
  "rcgen",
  "reishi-quinn",
@@ -4062,8 +4062,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "quincy-server"
-version = "3.1.0"
+name = "quincy-server-forked"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "clap",
@@ -4075,7 +4075,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
- "quincy",
+ "quincy-forked",
  "quinn",
  "reishi-quinn",
  "rustls",
@@ -4092,9 +4092,9 @@ dependencies = [
  "etherparse",
  "ipnet",
  "libc",
- "quincy",
  "quincy-client",
- "quincy-server",
+ "quincy-forked",
+ "quincy-server-forked",
  "rstest",
  "secrecy",
  "tokio",

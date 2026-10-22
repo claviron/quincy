@@ -1,5 +1,6 @@
 [package]
 name = "quincy-gui"
+publish.workspace = true
 description = "QUIC-based VPN - GUI client and daemon"
 readme = "../README.md"
 version.workspace = true
