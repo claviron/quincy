@@ -1,4 +1,5 @@
 pub mod address_pool;
+mod admission;
 mod connection;
 pub mod lifecycle;
 pub mod session;
@@ -6,7 +7,6 @@ pub mod session;
 #[cfg(feature = "metrics")]
 mod metrics;
 
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,17 +19,17 @@ use quinn::{Connection, Endpoint, Incoming, VarInt};
 use tokio::signal;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
+use crate::provider::{FileIdentityProvider, IdentityProvider, IdentitySnapshot};
 use crate::server::address_pool::AddressPoolManager;
+use crate::server::admission::{Admission, Pools, Updates};
 use crate::server::connection::{Assigned, Identified, QuincyConnection};
 use crate::server::session::{ConnectionSession, UserSessionRegistry};
-use crate::users::UsersFile;
 use quincy::Result;
-use quincy::config::{
-    AddressRange, AllowedNoiseKeys, NoiseKeyExchange, ServerConfig, ServerProtocolConfig,
-};
+use quincy::config::{ServerConfig, ServerProtocolConfig};
 use quincy::constants::{PACKET_BUFFER_SIZE, PACKET_CHANNEL_SIZE, QUINN_RUNTIME};
 use quincy::network::interface::{ActiveInterface, Interface, InterfaceIO};
 use quincy::network::packet::Packet;
@@ -86,7 +86,9 @@ pub struct QuincyServer {
     config: ServerConfig,
     connection_queues: ConnectionQueues,
     address_pool: Arc<AddressPoolManager>,
-    users: Arc<UsersFile>,
+    identities: watch::Receiver<Arc<IdentitySnapshot>>,
+    applied: watch::Sender<Arc<IdentitySnapshot>>,
+    pools: Pools,
     session_registry: Arc<UserSessionRegistry>,
     observer: Option<Arc<dyn lifecycle::Observer>>,
 }
@@ -99,25 +101,38 @@ impl QuincyServer {
     /// ### Arguments
     /// - `config` - the server configuration
     pub fn new(config: ServerConfig) -> Result<Self> {
-        let users = UsersFile::load(&config.users_file)?;
+        let provider = FileIdentityProvider::new(&config.users_file)?;
+        Self::new_with_identity_provider(config, &provider)
+    }
 
-        let user_pools: HashMap<String, Vec<AddressRange>> = users
-            .users
-            .iter()
-            .filter(|(_, entry)| !entry.address_pool.is_empty())
-            .map(|(name, entry)| (name.clone(), entry.address_pool.clone()))
-            .collect();
-
-        let address_pool = AddressPoolManager::new(config.tunnel_network, user_pools)?;
+    /// Uses a host-owned identity source without opening `config.users_file`.
+    /// The server owns its subscription; the host owns updates and persistence.
+    pub fn new_with_identity_provider(
+        config: ServerConfig,
+        provider: &dyn IdentityProvider,
+    ) -> Result<Self> {
+        let mut identities = provider.subscribe()?;
+        let initial = identities.borrow_and_update().clone();
+        let pools = initial.pools();
+        let address_pool = AddressPoolManager::new(config.tunnel_network, pools.clone())?;
+        let (applied, _) = watch::channel(initial);
 
         Ok(Self {
             config,
             connection_queues: Arc::new(DashMap::new()),
             address_pool: Arc::new(address_pool),
-            users: Arc::new(users),
+            identities,
+            applied,
+            pools,
             session_registry: Arc::new(UserSessionRegistry::new()),
             observer: None,
         })
+    }
+
+    /// Observes the initial identity and successfully installed replacements.
+    /// Rejected candidates are logged and never appear on this channel.
+    pub fn subscribe_identity(&self) -> watch::Receiver<Arc<IdentitySnapshot>> {
+        self.applied.subscribe()
     }
 
     /// Install a transport-independent lifecycle observer before starting IO.
@@ -211,7 +226,17 @@ impl QuincyServer {
         ingress_queue: Sender<Packet>,
         shutdown: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
-        let endpoint = self.create_quinn_endpoint()?;
+        let mut admission = Arc::new(Admission::prepare(
+            &self.config,
+            self.applied.borrow().clone(),
+            &self.pools,
+        )?);
+        let endpoint = self.create_quinn_endpoint(&admission)?;
+        let mut updates = Updates::new(
+            self.identities.clone(),
+            self.config.clone(),
+            self.pools.clone(),
+        );
 
         info!(
             "Starting connection handler: {}",
@@ -220,7 +245,6 @@ impl QuincyServer {
 
         let protocol = Arc::new(self.config.protocol.clone());
         let server_address = self.config.tunnel_network;
-        let users = self.users.clone();
         let address_pool = self.address_pool.clone();
         let session_registry = self.session_registry.clone();
 
@@ -234,9 +258,22 @@ impl QuincyServer {
 
         loop {
             if draining && connection_tasks.is_empty() && assignment_tasks.is_empty() {
+                updates.drain().await;
                 return shutdown_result;
             }
             tokio::select! {
+                candidate = updates.next(), if !draining && updates.is_open() => {
+                    match candidate {
+                        Some(Ok(candidate)) => {
+                            endpoint.set_server_config(Some(candidate.transport.as_ref().clone()));
+                            admission = Arc::new(candidate);
+                            self.applied.send_replace(admission.identity.clone());
+                            info!("Installed identity snapshot");
+                        }
+                        Some(Err(error)) => warn!("Identity snapshot rejected; retaining current admission: {error}"),
+                        None => debug!("Identity provider closed; retaining current admission"),
+                    }
+                }
                 // New connections
                 Some(handshake) = endpoint.accept(), if !draining => {
                     let client_ip = handshake.remote_address().ip();
@@ -256,7 +293,7 @@ impl QuincyServer {
                     }
 
                     let protocol = protocol.clone();
-                    let users = users.clone();
+                    let admission = admission.clone();
                     let ingress = ingress_queue.clone();
 
                     // Handshakes are driven in spawned tasks so that a
@@ -265,7 +302,7 @@ impl QuincyServer {
                     handshake_tasks.push(tokio::spawn(Self::handshake_and_identify(
                         handshake,
                         protocol,
-                        users,
+                        admission,
                         ingress,
                     )));
                 }
@@ -328,11 +365,7 @@ impl QuincyServer {
 
                     // Resolve effective bandwidth limit:
                     // per-user override > server default > None (unlimited)
-                    let bandwidth_limit = self
-                        .users
-                        .users
-                        .get(&username)
-                        .and_then(|entry| entry.bandwidth_limit)
+                    let bandwidth_limit = connection.bandwidth_limit()
                         .or(self.config.default_bandwidth_limit);
 
                     // Register session and obtain the shared rate limiter
@@ -412,18 +445,21 @@ impl QuincyServer {
     /// ### Arguments
     /// - `handshake` - the incoming connection to complete
     /// - `protocol` - the server protocol configuration
-    /// - `users` - the parsed users file
+    /// - `admission` - the pinned transport configuration and identity snapshot
     /// - `ingress_queue` - the queue for sending data to the TUN interface
     async fn handshake_and_identify(
         handshake: Incoming,
         protocol: Arc<ServerProtocolConfig>,
-        users: Arc<UsersFile>,
+        admission: Arc<Admission>,
         ingress_queue: Sender<Packet>,
     ) -> HandshakeOutcome {
         let client_ip = handshake.remote_address().ip();
 
-        // `Incoming` only implements `IntoFuture`, hence the async block wrapper.
-        let quic_connection = match timeout(HANDSHAKE_TIMEOUT, async move { handshake.await }).await
+        let transport = admission.transport.clone();
+        let quic_connection = match timeout(HANDSHAKE_TIMEOUT, async move {
+            handshake.accept_with(transport)?.await
+        })
+        .await
         {
             Ok(Ok(connection)) => connection,
             Ok(Err(e)) => {
@@ -443,7 +479,7 @@ impl QuincyServer {
         let connection = QuincyConnection::new(quic_connection, ingress_queue);
 
         // Identify the client (reads peer_identity + HashMap lookup)
-        match connection.identify(&protocol, &users) {
+        match connection.identify(&protocol, admission.identity.credentials()) {
             Ok(connection) => HandshakeOutcome::Identified {
                 connection,
                 quic_connection: quic_connection_clone,
@@ -460,30 +496,7 @@ impl QuincyServer {
     }
 
     /// Creates a Quinn QUIC endpoint that clients can connect to.
-    fn create_quinn_endpoint(&self) -> Result<Endpoint> {
-        // Build allowed keys/fingerprints from the users file
-        let (allowed_keys, allowed_fingerprints) = match &self.config.protocol {
-            ServerProtocolConfig::Noise(noise) => {
-                let keys = match noise.key_exchange {
-                    NoiseKeyExchange::Standard => Some(AllowedNoiseKeys::Standard(
-                        self.users.collect_noise_public_keys(),
-                    )),
-                    NoiseKeyExchange::Hybrid => Some(AllowedNoiseKeys::Hybrid(
-                        self.users.collect_noise_hybrid_public_keys(),
-                    )),
-                    NoiseKeyExchange::PostQuantum => Some(AllowedNoiseKeys::PostQuantum(
-                        self.users.collect_noise_pq_public_keys(),
-                    )),
-                };
-                (keys, None)
-            }
-            ServerProtocolConfig::Tls(_) => (None, Some(self.users.collect_cert_fingerprints())),
-        };
-
-        let quinn_config = self
-            .config
-            .as_quinn_server_config(allowed_keys, allowed_fingerprints)?;
-
+    fn create_quinn_endpoint(&self, admission: &Admission) -> Result<Endpoint> {
         let socket = bind_socket(
             SocketAddr::new(self.config.bind_address, self.config.bind_port),
             self.config.connection.send_buffer_size as usize,
@@ -497,7 +510,7 @@ impl QuincyServer {
             .as_endpoint_config(self.config.noise_key_exchange())?;
         let endpoint = Endpoint::new(
             endpoint_config,
-            Some(quinn_config),
+            Some(admission.transport.as_ref().clone()),
             socket,
             QUINN_RUNTIME.clone(),
         )?;

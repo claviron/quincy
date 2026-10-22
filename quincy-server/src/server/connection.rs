@@ -15,7 +15,7 @@ use crate::identity;
 use crate::server::address_pool::AddressPoolManager;
 use crate::server::session::BandwidthLimiter;
 use crate::users::UsersFile;
-use quincy::config::ServerProtocolConfig;
+use quincy::config::{Bandwidth, ServerProtocolConfig};
 use quincy::ip_assignment::{self, IpAssignment};
 use quincy::network::packet::Packet;
 use quincy::utils::tasks::abort_all;
@@ -30,12 +30,14 @@ pub struct New;
 /// Client identified via handshake peer identity.
 pub struct Identified {
     pub username: String,
+    pub bandwidth_limit: Option<Bandwidth>,
 }
 
 /// Client identified and tunnel IP assigned.
 pub struct Assigned {
     pub username: String,
     pub client_address: IpNet,
+    pub bandwidth_limit: Option<Bandwidth>,
 }
 
 /// Represents a Quincy connection whose lifecycle phase is tracked at the type level.
@@ -78,11 +80,18 @@ impl QuincyConnection<New> {
         users: &UsersFile,
     ) -> Result<QuincyConnection<Identified>> {
         let username = identity::identify_peer(&self.connection, protocol, users)?;
+        let bandwidth_limit = users
+            .users
+            .get(&username)
+            .and_then(|entry| entry.bandwidth_limit);
 
         Ok(QuincyConnection {
             connection: self.connection,
             ingress_queue: self.ingress_queue,
-            state: Identified { username },
+            state: Identified {
+                username,
+                bandwidth_limit,
+            },
         })
     }
 }
@@ -139,12 +148,18 @@ impl QuincyConnection<Identified> {
             state: Assigned {
                 username: self.state.username,
                 client_address,
+                bandwidth_limit: self.state.bandwidth_limit,
             },
         })
     }
 }
 
 impl QuincyConnection<Assigned> {
+    /// Returns the user policy pinned when this connection was authenticated.
+    pub fn bandwidth_limit(&self) -> Option<Bandwidth> {
+        self.state.bandwidth_limit
+    }
+
     /// Returns the username resolved during identification.
     pub fn username(&self) -> &str {
         &self.state.username

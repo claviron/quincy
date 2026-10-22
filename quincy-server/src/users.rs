@@ -80,6 +80,11 @@ pub struct UserEntry {
 }
 
 impl UsersFile {
+    /// Validates user entries and builds their credential lookup indices.
+    pub fn from_entries(users: HashMap<String, UserEntry>) -> Result<Self> {
+        Self::from_raw(RawUsersFile { users })
+    }
+
     /// Loads and parses a users file from the given path.
     ///
     /// ### Arguments
