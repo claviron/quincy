@@ -1,5 +1,6 @@
 pub mod address_pool;
 mod connection;
+pub mod lifecycle;
 pub mod session;
 
 #[cfg(feature = "metrics")]
@@ -79,6 +80,7 @@ pub struct QuincyServer {
     address_pool: Arc<AddressPoolManager>,
     users: Arc<UsersFile>,
     session_registry: Arc<UserSessionRegistry>,
+    observer: Option<Arc<dyn lifecycle::Observer>>,
 }
 
 impl QuincyServer {
@@ -106,11 +108,26 @@ impl QuincyServer {
             address_pool: Arc::new(address_pool),
             users: Arc::new(users),
             session_registry: Arc::new(UserSessionRegistry::new()),
+            observer: None,
         })
     }
 
-    /// Starts the tasks for this instance of Quincy tunnel and listens for incoming connections.
+    /// Install a transport-independent lifecycle observer before starting IO.
+    pub fn with_observer(mut self, observer: Arc<dyn lifecycle::Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Starts the standalone server with its ordinary process signal handler.
     pub async fn run<I: InterfaceIO>(&self) -> Result<()> {
+        self.run_until::<I>(shutdown_signal()).await
+    }
+
+    /// Run under a host's cancellation future without installing signal handlers.
+    pub async fn run_until<I: InterfaceIO>(
+        &self,
+        shutdown: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
         let interface: Interface<I> = Interface::create(
             self.config.tunnel_network,
             self.config.connection.mtu,
@@ -146,11 +163,24 @@ impl QuincyServer {
             )),
         ]);
 
-        let handler_task = self.handle_connections(sender);
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let handler_task = self.handle_connections(sender, async {
+            tokio::pin!(shutdown);
+            tokio::select! {
+                result = &mut shutdown => result,
+                _ = cancelled.changed() => Ok(()),
+            }
+        });
+        tokio::pin!(handler_task);
 
         let result = tokio::select! {
-            handler_task_result = handler_task => handler_task_result,
-            Some(task_result) = tasks.next() => task_result?,
+            handler_task_result = &mut handler_task => handler_task_result,
+            Some(task_result) = tasks.next() => {
+                cancel.send_replace(true);
+                // TUN failure must still close and reap every owned connection.
+                let cleanup = handler_task.await;
+                match task_result { Ok(result) => result.and(cleanup), Err(error) => Err(error.into()) }
+            },
         };
 
         let _ = abort_all(tasks).await;
@@ -168,7 +198,11 @@ impl QuincyServer {
     ///
     /// ### Arguments
     /// - `ingress_queue` - the queue for sending data to the TUN interface
-    async fn handle_connections(&self, ingress_queue: Sender<Packet>) -> Result<()> {
+    async fn handle_connections(
+        &self,
+        ingress_queue: Sender<Packet>,
+        shutdown: impl std::future::Future<Output = Result<()>>,
+    ) -> Result<()> {
         let endpoint = self.create_quinn_endpoint()?;
 
         info!(
@@ -186,13 +220,17 @@ impl QuincyServer {
         let mut connection_tasks = FuturesUnordered::new();
         let mut handshake_tasks = FuturesUnordered::new();
 
-        let shutdown = shutdown_signal();
         tokio::pin!(shutdown);
+        let mut draining = false;
+        let mut shutdown_result = Ok(());
 
         loop {
+            if draining && connection_tasks.is_empty() && assignment_tasks.is_empty() {
+                return shutdown_result;
+            }
             tokio::select! {
                 // New connections
-                Some(handshake) = endpoint.accept() => {
+                Some(handshake) = endpoint.accept(), if !draining => {
                     let client_ip = handshake.remote_address().ip();
 
                     debug!(
@@ -268,6 +306,17 @@ impl QuincyServer {
 
                     let client_address = connection.client_address();
                     let username = connection.username().to_string();
+                    if draining {
+                        self.address_pool.release_address(&username, &client_address.addr());
+                        continue;
+                    }
+
+                    if let Some(observer) = &self.observer {
+                        observer.connected(lifecycle::Session {
+                            username: username.clone(),
+                            address: client_address,
+                        });
+                    }
 
                     // Resolve effective bandwidth limit:
                     // per-user override > server default > None (unlimited)
@@ -310,6 +359,13 @@ impl QuincyServer {
                     self.address_pool.release_address(username, &client_address.addr());
                     session_registry.remove_connection(username, &client_address);
 
+                    if let Some(observer) = &self.observer {
+                        observer.disconnected(lifecycle::Session {
+                            username: username.to_string(),
+                            address: client_address,
+                        });
+                    }
+
                     warn!(
                         "Connection with client {} (user '{username}') has encountered an error: {err}",
                         client_address.addr()
@@ -317,16 +373,14 @@ impl QuincyServer {
                 }
 
                 // Shutdown
-                shutdown_result = &mut shutdown => {
-                    shutdown_result?;
+                result = &mut shutdown, if !draining => {
+                    shutdown_result = result;
 
                     info!("Received shutdown signal, shutting down");
                     let _ = abort_all(handshake_tasks).await;
-                    let _ = abort_all(connection_tasks).await;
-
+                    handshake_tasks = FuturesUnordered::new();
                     endpoint.close(VarInt::from_u32(0x01), "Server shutdown".as_bytes());
-
-                    return Ok(());
+                    draining = true;
                 }
             }
         }
