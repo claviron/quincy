@@ -40,6 +40,7 @@ pub struct TestInterface<T> {
     _p: std::marker::PhantomData<T>,
     pub tx: TestSender,
     pub rx: TestReceiver,
+    pub fail_routes: bool,
 }
 
 impl<T> TestInterface<T> {
@@ -49,6 +50,7 @@ impl<T> TestInterface<T> {
             _p: std::marker::PhantomData,
             tx,
             rx,
+            fail_routes: false,
         }
     }
 }
@@ -121,12 +123,19 @@ impl<T: 'static + Send + Sync> InterfaceIO for TestInterface<T> {
         Ok(Self::new(tx, rx))
     }
 
-    /// No-op for test interfaces.
+    /// Allows startup tests to reject deferred route configuration.
     fn configure_routes(
         &self,
         _routes: &[IpNet],
         _remote_address: Option<IpAddr>,
     ) -> quincy::Result<Option<InstalledExclusionRoute>> {
+        if self.fail_routes {
+            return Err(quincy::error::RouteError::AddFailed {
+                destination: "192.0.2.0/24".into(),
+                message: "forced route installation failure".into(),
+            }
+            .into());
+        }
         Ok(None)
     }
 

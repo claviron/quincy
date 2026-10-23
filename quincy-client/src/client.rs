@@ -90,11 +90,34 @@ impl QuincyClient {
             return Err(QuincyError::system("Client is already started"));
         }
 
-        let (connection, server_addr) = self.connect_to_server().await?;
+        let (connection, server_addr, endpoint) = self.connect_to_server().await?;
+        let result = self
+            .start_connected(&connection, server_addr, create_interface)
+            .await;
+        if result.is_err() {
+            // A TLS/QUIC handshake is not a usable VPN. On local setup failure,
+            // flush the close before a CLI caller can exit the process; the
+            // server must not retain an IP/session until its idle timeout.
+            connection.close(quinn::VarInt::from_u32(0x01), b"Client setup failed");
+            drop(connection);
+            endpoint.wait_idle().await;
+        }
+        result
+    }
 
+    async fn start_connected<I, F>(
+        &mut self,
+        connection: &Connection,
+        server_addr: SocketAddr,
+        create_interface: F,
+    ) -> Result<()>
+    where
+        I: InterfaceIO,
+        F: FnOnce(ClientInterfaceConfig) -> Result<Interface<I>>,
+    {
         // Receive IP assignment from server (sent over uni-stream after handshake)
         let assignment =
-            ip_assignment::recv_ip_assignment(&connection, IP_ASSIGNMENT_TIMEOUT).await?;
+            ip_assignment::recv_ip_assignment(connection, IP_ASSIGNMENT_TIMEOUT).await?;
 
         let client_address = assignment.client_address;
         let server_address = assignment.server_address;
@@ -121,10 +144,12 @@ impl QuincyClient {
 
         let interface = create_interface(interface_config)?;
 
-        let relayer = ClientRelayer::start(interface, connection)?;
+        let relayer = ClientRelayer::start(interface, connection.clone())?;
         self.client_address = Some(client_address);
         self.server_address = Some(server_address);
         self.relayer.replace(relayer);
+
+        info!("VPN ready: {}", self.config.connection_string);
 
         Ok(())
     }
@@ -210,8 +235,8 @@ impl QuincyClient {
     /// Connects to the Quincy server.
     ///
     /// ### Returns
-    /// A tuple of the Quinn connection and the resolved server socket address.
-    async fn connect_to_server(&self) -> Result<(Connection, SocketAddr)> {
+    /// The connection, resolved server address and endpoint owning its I/O.
+    async fn connect_to_server(&self) -> Result<(Connection, SocketAddr, Endpoint)> {
         let quinn_config = self.config.quinn_client_config()?;
 
         let (host_part, _port) =
@@ -253,9 +278,12 @@ impl QuincyClient {
             .connect_with(quinn_config, server_addr, server_hostname)?
             .await?;
 
-        info!("Connection established: {}", self.config.connection_string);
+        debug!(
+            "QUIC connection established: {}",
+            self.config.connection_string
+        );
 
-        Ok((connection, server_addr))
+        Ok((connection, server_addr, endpoint))
     }
 
     /// Creates a Quinn endpoint.

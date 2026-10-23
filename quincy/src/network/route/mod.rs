@@ -2,8 +2,15 @@ use std::net::IpAddr;
 
 #[cfg(unix)]
 mod posix;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub use posix::add_routes;
 #[cfg(unix)]
-pub use posix::{add_routes, remove_exclusion_route};
+pub use posix::remove_exclusion_route;
+
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::add_routes;
 
 #[cfg(target_os = "windows")]
 mod windows;

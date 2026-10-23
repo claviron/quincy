@@ -41,11 +41,23 @@ const ROUTE_COMMAND: &str = "route";
 /// - `tunnel_interface` - the name of the tunnel interface being configured;
 ///   used to reject exclusion next-hops that resolve through the tunnel itself
 /// - `remote_address` - optional VPN server address requiring an exclusion route
+#[cfg(not(target_os = "macos"))]
 pub fn add_routes(
     networks: &[IpNet],
     gateway: &IpAddr,
     tunnel_interface: &str,
     remote_address: Option<IpAddr>,
+) -> Result<Option<InstalledExclusionRoute>> {
+    add_routes_with(networks, tunnel_interface, remote_address, |network| {
+        add_route(network, gateway)
+    })
+}
+
+pub(super) fn add_routes_with(
+    networks: &[IpNet],
+    tunnel_interface: &str,
+    remote_address: Option<IpAddr>,
+    mut install: impl FnMut(&IpNet) -> Result<()>,
 ) -> Result<Option<InstalledExclusionRoute>> {
     // On BSD, split exact default routes before coverage checks and route
     // installation so the kernel sees /1 pairs instead of /0.
@@ -79,7 +91,7 @@ pub fn add_routes(
     };
 
     for network in effective_networks {
-        if let Err(add_err) = add_route(network, gateway) {
+        if let Err(add_err) = install(network) {
             if let Some(ref token) = exclusion
                 && let Err(rm_err) = remove_exclusion_route(token)
             {
@@ -177,6 +189,7 @@ pub(crate) fn any_route_covers_address(routes: &[IpNet], address: &IpAddr) -> bo
     routes.iter().any(|net| net.contains(address))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn add_route(network: &IpNet, gateway: &IpAddr) -> Result<()> {
     let args = user_route_add_args(network, gateway);
     let program = &args[0];
@@ -226,31 +239,6 @@ fn user_route_add_args(network: &IpNet, gateway: &IpAddr) -> Vec<String> {
         gateway.to_string(),
     ]);
     args
-}
-
-/// Builds the argv for a user-route add command on macOS.
-#[cfg(target_os = "macos")]
-fn user_route_add_args(network: &IpNet, gateway: &IpAddr) -> Vec<String> {
-    match network {
-        IpNet::V4(_) => vec![
-            ROUTE_COMMAND.to_string(),
-            "-n".to_string(),
-            "add".to_string(),
-            "-net".to_string(),
-            network.addr().to_string(),
-            "-netmask".to_string(),
-            network.netmask().to_string(),
-            gateway.to_string(),
-        ],
-        IpNet::V6(_) => vec![
-            ROUTE_COMMAND.to_string(),
-            "-n".to_string(),
-            "add".to_string(),
-            "-inet6".to_string(),
-            format!("{}/{}", network.addr(), network.prefix_len()),
-            gateway.to_string(),
-        ],
-    }
 }
 
 /// Builds the argv for a user-route add command on FreeBSD.
@@ -1876,49 +1864,6 @@ destination: default
                     "add",
                     "2001:db8::/32",
                     "via",
-                    "2001:db8::1"
-                ]
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    mod user_route_args_macos {
-        use super::*;
-
-        #[test]
-        fn ipv4_add_argv() {
-            let net: IpNet = "10.0.0.0/24".parse().unwrap();
-            let gw: IpAddr = "192.168.1.1".parse().unwrap();
-            let args = user_route_add_args(&net, &gw);
-            assert_eq!(
-                args,
-                [
-                    ROUTE_COMMAND,
-                    "-n",
-                    "add",
-                    "-net",
-                    "10.0.0.0",
-                    "-netmask",
-                    "255.255.255.0",
-                    "192.168.1.1"
-                ]
-            );
-        }
-
-        #[test]
-        fn ipv6_add_argv() {
-            let net: IpNet = "2001:db8::/32".parse().unwrap();
-            let gw: IpAddr = "2001:db8::1".parse().unwrap();
-            let args = user_route_add_args(&net, &gw);
-            assert_eq!(
-                args,
-                [
-                    ROUTE_COMMAND,
-                    "-n",
-                    "add",
-                    "-inet6",
-                    "2001:db8::/32",
                     "2001:db8::1"
                 ]
             );

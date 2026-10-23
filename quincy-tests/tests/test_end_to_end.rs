@@ -247,6 +247,76 @@ async fn test_start_with_interface_failure_leaves_client_stopped() {
     assert_eq!(client.server_address(), None);
 }
 
+#[tokio::test]
+async fn test_route_installation_failure_never_marks_client_running() {
+    use quincy::network::interface::InterfaceIO;
+    use quincy_server::server::lifecycle::{Observer, Session};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Sessions(Mutex<Vec<bool>>);
+    impl Observer for Sessions {
+        fn connected(&self, _session: Session) {
+            self.0.lock().unwrap().push(true);
+        }
+        fn disconnected(&self, _session: Session) {
+            self.0.lock().unwrap().push(false);
+        }
+    }
+
+    struct Client;
+    struct Server;
+    let _client_ch = setup_interface::<Client>();
+    let _server_ch = setup_interface::<Server>();
+    let config_dir = Path::new("tests/static/configs/tls_standard");
+    let mut client_config =
+        ClientConfig::from_path(&config_dir.join("client.toml"), "QUINCY_").unwrap();
+    let mut server_config =
+        ServerConfig::from_path(&config_dir.join("server.toml"), "QUINCY_").unwrap();
+    use_ephemeral_server_port(&mut client_config, &mut server_config);
+    let mut client = QuincyClient::new(client_config);
+    let sessions = Arc::new(Sessions::default());
+    let server = QuincyServer::new(server_config)
+        .unwrap()
+        .with_observer(sessions.clone());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        server
+            .run_until::<TestInterface<Server>>(async {
+                shutdown_rx
+                    .await
+                    .map_err(|_| QuincyError::system("test shutdown sender dropped"))
+            })
+            .await
+    });
+    let result = client
+        .start_with_interface::<TestInterface<Client>, _>(|config| {
+            let mut interface = TestInterface::<Client>::create_interface(
+                config.client_address,
+                config.mtu,
+                config.tunnel_gateway,
+                None,
+            )?;
+            interface.fail_routes = true;
+            Ok(Interface::from_io(
+                interface,
+                Some(vec!["192.0.2.0/24".parse().unwrap()]),
+                None,
+                None,
+            ))
+        })
+        .await;
+    assert!(matches!(result, Err(QuincyError::Route(_))));
+    assert!(!client.is_running());
+    assert_eq!(client.client_address(), None);
+    assert_eq!(client.server_address(), None);
+    // Setup failure flushes the QUIC close before returning. The server must
+    // already have released the session, without waiting for its idle timeout.
+    assert_eq!(*sessions.0.lock().unwrap(), [true, false]);
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn test_start_with_tun_fd_failure_closes_fd_and_leaves_client_stopped() {

@@ -4,7 +4,11 @@ use crate::error::InterfaceError;
 use crate::network::dns::{add_dns_servers, delete_dns_servers};
 use crate::network::interface::InterfaceIO;
 use crate::network::packet::Packet;
-use crate::network::route::{InstalledExclusionRoute, add_routes};
+use crate::network::route::InstalledExclusionRoute;
+#[cfg(not(target_os = "macos"))]
+use crate::network::route::add_routes;
+#[cfg(target_os = "macos")]
+use crate::network::route::macos::Routes;
 use bytes::BytesMut;
 use ipnet::IpNet;
 use quincy_tun::{AsyncDevice, DeviceBuilder, ToIpv4Address};
@@ -25,17 +29,21 @@ pub struct QuincyTunInterface {
     reader_task: JoinHandle<Result<()>>,
     writer_task: JoinHandle<Result<()>>,
     mtu: u16,
+    #[cfg(not(target_os = "macos"))]
     gateway: Option<IpAddr>,
     torn_down: AtomicBool,
     disable_on_teardown: bool,
+    #[cfg(target_os = "macos")]
+    routes: std::sync::Mutex<Option<Routes>>,
 }
 
 impl QuincyTunInterface {
     fn from_async_device(
         interface: AsyncDevice,
         mtu: u16,
-        tunnel_gateway: Option<IpAddr>,
+        _tunnel_gateway: Option<IpAddr>,
         disable_on_teardown: bool,
+        #[cfg(target_os = "macos")] routes: Option<Routes>,
     ) -> Self {
         let interface = Arc::new(interface);
 
@@ -54,9 +62,12 @@ impl QuincyTunInterface {
             reader_task: reader_handle,
             writer_task: writer_handle,
             mtu,
-            gateway: tunnel_gateway,
+            #[cfg(not(target_os = "macos"))]
+            gateway: _tunnel_gateway,
             torn_down: AtomicBool::new(false),
             disable_on_teardown,
+            #[cfg(target_os = "macos")]
+            routes: std::sync::Mutex::new(routes),
         }
     }
 
@@ -85,6 +96,8 @@ impl QuincyTunInterface {
             mtu,
             tunnel_gateway,
             false,
+            #[cfg(target_os = "macos")]
+            None,
         ))
     }
 }
@@ -104,6 +117,7 @@ impl InterfaceIO for QuincyTunInterface {
             builder = builder.name(interface_name);
         }
 
+        #[cfg(not(target_os = "macos"))]
         let builder = match interface_address {
             IpNet::V4(interface_address) => {
                 let addr = interface_address.addr();
@@ -135,6 +149,26 @@ impl InterfaceIO for QuincyTunInterface {
             .build_async()
             .map_err(|_| InterfaceError::CreationFailed)?;
 
+        #[cfg(target_os = "macos")]
+        let routes = {
+            // quincy-tun's automatic subnet route is unscoped and logs route
+            // failures instead of propagating them. Configure the address
+            // without that route, then install our interface-owned routes
+            // before starting any packet tasks or reporting success.
+            interface.set_associate_route(false);
+            match interface_address {
+                IpNet::V4(address) => interface.set_network_address(
+                    address.addr(),
+                    address.prefix_len(),
+                    tunnel_gateway.and_then(|gateway| gateway.ipv4().ok()),
+                )?,
+                IpNet::V6(address) => {
+                    interface.add_address_v6(address.addr(), address.prefix_len())?;
+                }
+            }
+            Routes::new(interface.name()?, interface_address)?
+        };
+
         info!(
             "Created interface: {}",
             interface.name().unwrap_or("Unknown".to_string())
@@ -145,6 +179,8 @@ impl InterfaceIO for QuincyTunInterface {
             mtu,
             tunnel_gateway,
             true,
+            #[cfg(target_os = "macos")]
+            Some(routes),
         ))
     }
 
@@ -153,6 +189,20 @@ impl InterfaceIO for QuincyTunInterface {
         routes: &[IpNet],
         remote_address: Option<IpAddr>,
     ) -> Result<Option<InstalledExclusionRoute>> {
+        #[cfg(target_os = "macos")]
+        let exclusion_token = self
+            .routes
+            .lock()
+            .map_err(|_| InterfaceError::ConfigurationFailed {
+                reason: "TUN route ownership lock poisoned".into(),
+            })?
+            .as_mut()
+            .ok_or_else(|| InterfaceError::ConfigurationFailed {
+                reason: "Routes for an external TUN are owned by its caller".into(),
+            })?
+            .configure(routes, remote_address)?;
+
+        #[cfg(not(target_os = "macos"))]
         let exclusion_token = add_routes(
             routes,
             &self
@@ -305,6 +355,11 @@ impl QuincyTunInterface {
 
         self.reader_task.abort();
         self.writer_task.abort();
+
+        #[cfg(target_os = "macos")]
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.take();
+        }
 
         if self.disable_on_teardown {
             self.inner
