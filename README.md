@@ -161,6 +161,7 @@ _The current way this is done is using rather primitive privilege escallation co
 
 ### Server
 The Quincy server requires a separate configuration file, an example of which can be found in [`examples/server.toml`](examples/server.toml).
+See [routing and DNS policy](docs/network-policy.md) for server-provided split/full tunnel settings and client preferences.
 The documentation for the server configuration file fields can be found [here](https://docs.rs/quincy/latest/quincy/config/struct.ServerConfig.html).
 
 With the configuration file in place, the client can be started using the following command:

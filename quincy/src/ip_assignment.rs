@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
 use crate::error::{AuthError, Result};
+use crate::network_policy::NetworkPolicy;
+
+/// Bounded assignment envelope, including at most 64 routes, 64 exclusions and 16 DNS servers.
+pub const MAX_ASSIGNMENT_BYTES: usize = 16 * 1024;
 
 /// IP assignment payload sent from server to client after authentication.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +24,9 @@ pub struct IpAssignment {
     pub client_address: IpNet,
     /// The server's tunnel address (with network mask).
     pub server_address: IpNet,
+    /// Optional authenticated policy; absent on legacy servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkPolicy>,
 }
 
 /// Sends an IP assignment to the client over a QUIC uni-directional stream.
@@ -40,13 +47,17 @@ pub async fn send_ip_assignment(
     assignment: &IpAssignment,
     duration: Duration,
 ) -> Result<()> {
+    validate_assignment(assignment)?;
+    let payload = serde_json::to_vec(assignment)?;
+    if payload.len() > MAX_ASSIGNMENT_BYTES {
+        return Err(AuthError::IpAssignmentFailed.into());
+    }
     timeout(duration, async {
         let mut send_stream = connection
             .open_uni()
             .await
             .map_err(|_| AuthError::IpAssignmentFailed)?;
 
-        let payload = serde_json::to_vec(assignment)?;
         send_stream.write_all(&payload).await?;
         send_stream
             .finish()
@@ -83,7 +94,7 @@ pub async fn recv_ip_assignment(
             .map_err(|_| AuthError::IpAssignmentFailed)?;
 
         let payload = recv_stream
-            .read_to_end(4096)
+            .read_to_end(MAX_ASSIGNMENT_BYTES)
             .await
             .map_err(|_| AuthError::IpAssignmentFailed)?;
 
@@ -150,6 +161,10 @@ fn validate_assignment(assignment: &IpAssignment) -> Result<()> {
         return Err(AuthError::IpAssignmentFailed.into());
     }
 
+    if let Some(policy) = &assignment.network {
+        policy.validate(server)?;
+    }
+
     Ok(())
 }
 
@@ -158,6 +173,80 @@ mod tests {
     use super::*;
     use crate::error::QuincyError;
     use std::str::FromStr;
+
+    #[test]
+    fn network_policy_legacy_assignment_keeps_its_wire_shape() {
+        let payload = br#"{"client_address":"192.0.2.2/24","server_address":"192.0.2.1/24"}"#;
+        let assignment: IpAssignment = serde_json::from_slice(payload).unwrap();
+        assert!(assignment.network.is_none());
+        validate_assignment(&assignment).unwrap();
+        assert!(
+            !serde_json::to_value(assignment)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("network")
+        );
+    }
+
+    #[test]
+    fn network_policy_assignment_round_trips_and_old_readers_ignore_extension() {
+        let assignment = IpAssignment {
+            client_address: make_ipv4("192.0.2.2", 24),
+            server_address: make_ipv4("192.0.2.1", 24),
+            network: Some(NetworkPolicy {
+                mode: crate::network_policy::TunnelMode::Full,
+                excluded_routes: vec!["203.0.113.0/24".parse().unwrap()],
+                dns_servers: vec!["192.0.2.1".parse().unwrap()],
+                ..NetworkPolicy::default()
+            }),
+        };
+        let bytes = serde_json::to_vec(&assignment).unwrap();
+        let decoded: IpAssignment = serde_json::from_slice(&bytes).unwrap();
+        validate_assignment(&decoded).unwrap();
+        assert_eq!(assignment.network, decoded.network);
+        #[derive(Deserialize)]
+        struct LegacyAssignment {
+            client_address: IpNet,
+            server_address: IpNet,
+        }
+        let legacy: LegacyAssignment = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.client_address, assignment.client_address);
+        assert_eq!(legacy.server_address, assignment.server_address);
+    }
+
+    #[test]
+    fn network_policy_assignment_rejects_invalid_received_policy() {
+        let payload = br#"{"client_address":"192.0.2.2/24","server_address":"192.0.2.1/24","network":{"dns_servers":["0.0.0.0"]}}"#;
+        let assignment: IpAssignment = serde_json::from_slice(payload).unwrap();
+        assert!(validate_assignment(&assignment).is_err());
+    }
+
+    #[test]
+    fn network_policy_maximum_wire_lists_fit_assignment_envelope() {
+        let assignment = IpAssignment {
+            client_address: make_ipv6("2001:db8::2", 64),
+            server_address: make_ipv6("2001:db8::1", 64),
+            network: Some(NetworkPolicy {
+                routes: vec![
+                    make_ipv6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe", 128);
+                    crate::network_policy::MAX_POLICY_ROUTES
+                ],
+                excluded_routes: vec![
+                    make_ipv6("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", 128);
+                    crate::network_policy::MAX_POLICY_ROUTES
+                ],
+                dns_servers: vec![
+                    "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe".parse().unwrap();
+                    crate::network_policy::MAX_POLICY_DNS
+                ],
+                ..NetworkPolicy::default()
+            }),
+        };
+        // Wire capacity is a separate bound from semantic validity (these DNS
+        // addresses are intentionally maximally long, not usable unicast).
+        assert!(serde_json::to_vec(&assignment).unwrap().len() <= MAX_ASSIGNMENT_BYTES);
+    }
 
     fn make_ipv4(addr: &str, prefix: u8) -> IpNet {
         IpNet::from_str(&format!("{}/{}", addr, prefix)).unwrap()
@@ -262,6 +351,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 24),
                 server_address: make_ipv4("10.0.0.1", 24),
+                network: None,
             };
             assert!(validate_assignment(&assignment).is_ok());
         }
@@ -271,6 +361,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv6("fd00::2", 64),
                 server_address: make_ipv6("fd00::1", 64),
+                network: None,
             };
             assert!(validate_assignment(&assignment).is_ok());
         }
@@ -280,6 +371,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 24),
                 server_address: make_ipv4("192.168.1.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -294,6 +386,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv6("fd00::2", 64),
                 server_address: make_ipv6("fd01::1", 64),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -304,6 +397,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 24),
                 server_address: make_ipv4("10.0.1.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -314,6 +408,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.1.2", 24),
                 server_address: make_ipv4("10.0.2.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -324,6 +419,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("127.0.0.1", 8),
                 server_address: make_ipv4("10.0.0.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -334,6 +430,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 24),
                 server_address: make_ipv4("127.0.0.1", 8),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -344,6 +441,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("0.0.0.0", 24),
                 server_address: make_ipv4("10.0.0.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -354,6 +452,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("224.0.0.1", 24),
                 server_address: make_ipv4("10.0.0.1", 24),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -364,6 +463,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 24),
                 server_address: make_ipv4("255.255.255.255", 32),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());
@@ -374,6 +474,7 @@ mod tests {
             let assignment = IpAssignment {
                 client_address: make_ipv4("10.0.0.2", 0),
                 server_address: make_ipv4("10.0.0.1", 0),
+                network: None,
             };
             let result = validate_assignment(&assignment);
             assert!(result.is_err());

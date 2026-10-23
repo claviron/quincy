@@ -15,6 +15,7 @@ use quincy::ip_assignment;
 use quincy::network::interface::quincy_tun::QuincyTunInterface;
 use quincy::network::interface::{Interface, InterfaceIO};
 use quincy::network::socket::bind_socket;
+use quincy::network_policy::resolve_network;
 use quincy::{QuincyError, Result};
 
 use crate::relayer::ClientRelayer;
@@ -101,14 +102,20 @@ impl QuincyClient {
         info!("Received client address: {client_address}");
         info!("Received server address: {server_address}");
 
+        let network = resolve_network(
+            &self.config.network,
+            assignment.network.as_ref(),
+            server_address,
+        )?;
+
         let interface_config = ClientInterfaceConfig {
             client_address,
             server_address,
             mtu: self.config.connection.mtu,
             tunnel_gateway: Some(server_address.addr()),
             interface_name: self.config.network.interface_name.clone(),
-            routes: self.config.network.routes.clone(),
-            dns_servers: self.config.network.dns_servers.clone(),
+            routes: network.routes,
+            dns_servers: network.dns_servers,
             remote_address: server_addr.ip(),
         };
 

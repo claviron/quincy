@@ -111,6 +111,9 @@ impl QuincyServer {
         config: ServerConfig,
         provider: &dyn IdentityProvider,
     ) -> Result<Self> {
+        if let Some(policy) = &config.network {
+            policy.validate(config.tunnel_network)?;
+        }
         let mut identities = provider.subscribe()?;
         let initial = identities.borrow_and_update().clone();
         let pools = initial.pools();
@@ -325,9 +328,10 @@ impl QuincyServer {
 
                     let address_pool = address_pool.clone();
                     let server_addr = server_address;
+                    let network = self.config.network.clone();
 
                     assignment_tasks.push(async move {
-                        let result = connection.assign_ip(&address_pool, server_addr).await;
+                        let result = connection.assign_ip(&address_pool, server_addr, network).await;
                         AssignmentResult {
                             result,
                             quic_connection,

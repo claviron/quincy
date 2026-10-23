@@ -61,6 +61,9 @@ pub struct ServerConfig {
     pub reuse_socket: bool,
     /// The network address of this tunnel (address + mask)
     pub tunnel_network: IpNet,
+    /// Optional routing and DNS policy sent to authenticated clients.
+    #[serde(default)]
+    pub network: Option<crate::network_policy::NetworkPolicy>,
     /// Path to the TOML users file for authentication
     pub users_file: PathBuf,
     /// Whether to isolate clients from each other (default = true)
@@ -283,6 +286,12 @@ pub struct ConnectionConfig {
 /// Network configuration.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct NetworkConfig {
+    /// Accept server routes when no explicit local routes are configured.
+    #[serde(default = "default_true_fn")]
+    pub accept_server_routes: bool,
+    /// Apply local or server DNS servers. False preserves the system DNS.
+    #[serde(default = "default_true_fn")]
+    pub use_dns: bool,
     /// Routes/networks to be routed through the tunnel
     ///
     /// In the format of `address/mask`, e.g.:
@@ -782,6 +791,8 @@ impl Default for ConnectionConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
+            accept_server_routes: true,
+            use_dns: true,
             routes: default_routes(),
             dns_servers: default_dns_servers(),
             interface_name: None,
@@ -1109,6 +1120,9 @@ impl ServerConfig {
         allowed_keys: Option<AllowedNoiseKeys>,
         allowed_fingerprints: Option<HashSet<String>>,
     ) -> Result<quinn::ServerConfig> {
+        if let Some(policy) = &self.network {
+            policy.validate(self.tunnel_network)?;
+        }
         match &self.protocol {
             ServerProtocolConfig::Tls(tls) => {
                 self.build_tls_server_config(tls, allowed_fingerprints.unwrap_or_default())
@@ -1759,6 +1773,7 @@ mod tests {
             bind_port: 55555,
             reuse_socket: false,
             tunnel_network: "10.0.0.1/24".parse().unwrap(),
+            network: None,
             users_file: PathBuf::from("users.toml"),
             isolate_clients: true,
             default_bandwidth_limit: None,

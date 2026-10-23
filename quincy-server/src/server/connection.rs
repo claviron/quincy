@@ -18,6 +18,7 @@ use crate::users::UsersFile;
 use quincy::config::{Bandwidth, ServerProtocolConfig};
 use quincy::ip_assignment::{self, IpAssignment};
 use quincy::network::packet::Packet;
+use quincy::network_policy::NetworkPolicy;
 use quincy::utils::tasks::abort_all;
 use quincy::{QuincyError, Result};
 
@@ -113,10 +114,12 @@ impl QuincyConnection<Identified> {
     /// ### Arguments
     /// - `address_pool` - the address pool manager
     /// - `server_address` - the server's tunnel address
+    /// - `network` - optional routing and DNS policy for this connection
     pub async fn assign_ip(
         self,
         address_pool: &AddressPoolManager,
         server_address: IpNet,
+        network: Option<NetworkPolicy>,
     ) -> Result<QuincyConnection<Assigned>> {
         let client_address = address_pool
             .allocate_address(&self.state.username)
@@ -125,6 +128,7 @@ impl QuincyConnection<Identified> {
         let assignment = IpAssignment {
             client_address,
             server_address,
+            network,
         };
 
         if let Err(e) =
