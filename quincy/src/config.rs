@@ -1125,12 +1125,31 @@ impl ServerConfig {
         }
         match &self.protocol {
             ServerProtocolConfig::Tls(tls) => {
-                self.build_tls_server_config(tls, allowed_fingerprints.unwrap_or_default())
+                self.build_tls_server_config(tls, allowed_fingerprints.unwrap_or_default(), None)
             }
             ServerProtocolConfig::Noise(noise) => {
                 self.build_noise_server_config(noise, allowed_keys)
             }
         }
+    }
+
+    /// Use a host-owned server key and public client CA trust instead of TLS files.
+    /// The supplied fingerprints are still required for user authorization.
+    pub fn as_quinn_server_config_with_tls(
+        &self,
+        identity: &crate::tls::Identity,
+        allowed_fingerprints: HashSet<String>,
+    ) -> Result<quinn::ServerConfig> {
+        if let Some(policy) = &self.network {
+            policy.validate(self.tunnel_network)?;
+        }
+        let ServerProtocolConfig::Tls(tls) = &self.protocol else {
+            return Err(ConfigError::Conflict {
+                conflict: "host TLS identity requires TLS protocol mode".into(),
+            }
+            .into());
+        };
+        self.build_tls_server_config(tls, allowed_fingerprints, Some(identity))
     }
 
     /// Builds a TLS-based Quinn server configuration with mutual authentication.
@@ -1142,31 +1161,41 @@ impl ServerConfig {
         &self,
         tls: &ServerTlsConfig,
         allowed_fingerprints: HashSet<String>,
+        identity: Option<&crate::tls::Identity>,
     ) -> Result<quinn::ServerConfig> {
-        let key = load_identity_private_key(
-            tls.certificate_key_file.as_ref(),
-            tls.certificate_key.as_ref().map(|key| key.expose_secret()),
-            "protocol.certificate_key_file",
-            "protocol.certificate_key",
-        )?;
-        let certs = load_identity_certificates(
-            tls.certificate_file.as_ref(),
-            tls.certificate.as_deref(),
-            "protocol.certificate_file",
-            "protocol.certificate",
-        )?;
+        let crypto_provider = Arc::new(tls_crypto_provider(&tls.key_exchange));
+        let mut rustls_config = if let Some(identity) = identity {
+            let verifier = identity.verifier(crypto_provider.clone(), allowed_fingerprints)?;
+            rustls::ServerConfig::builder_with_provider(crypto_provider)
+                .with_protocol_versions(TLS_PROTOCOL_VERSIONS)?
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                    identity.key.clone(),
+                )))
+        } else {
+            let key = load_identity_private_key(
+                tls.certificate_key_file.as_ref(),
+                tls.certificate_key.as_ref().map(|key| key.expose_secret()),
+                "protocol.certificate_key_file",
+                "protocol.certificate_key",
+            )?;
+            let certs = load_identity_certificates(
+                tls.certificate_file.as_ref(),
+                tls.certificate.as_deref(),
+                "protocol.certificate_file",
+                "protocol.certificate",
+            )?;
 
-        let crypto_provider = Arc::from(tls_crypto_provider(&tls.key_exchange));
+            let verifier = Arc::new(crate::certificates::QuincyCertVerifier::new(
+                allowed_fingerprints,
+                &crypto_provider,
+            ));
 
-        let verifier = Arc::new(crate::certificates::QuincyCertVerifier::new(
-            allowed_fingerprints,
-            &crypto_provider,
-        ));
-
-        let mut rustls_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
-            .with_protocol_versions(TLS_PROTOCOL_VERSIONS)?
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?;
+            rustls::ServerConfig::builder_with_provider(crypto_provider)
+                .with_protocol_versions(TLS_PROTOCOL_VERSIONS)?
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)?
+        };
 
         rustls_config.alpn_protocols.clone_from(&TLS_ALPN_PROTOCOLS);
         rustls_config.max_early_data_size = 0;

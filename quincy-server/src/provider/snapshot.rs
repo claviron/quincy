@@ -8,8 +8,9 @@ use crate::users::{UserEntry, UsersFile};
 
 /// Validated, immutable users and credential indices. Contains no private keys.
 ///
-/// TLS uses the existing fingerprint-pinning semantics, not CA or certificate
-/// expiry validation. Session state and allocated IP addresses are not stored here.
+/// TLS fingerprints grant user access. Ordinary file TLS retains pin-only
+/// verification; a host-owned TLS identity additionally verifies the CA chain
+/// and validity period. Session state and allocated IPs are not stored here.
 /// User map keys are stable allocation/session identities; renaming one creates
 /// a different principal rather than moving its active connections.
 #[derive(Debug)]

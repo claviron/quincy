@@ -12,6 +12,7 @@ pub mod error;
 pub mod ip_assignment;
 pub mod network;
 pub mod network_policy;
+pub mod tls;
 pub mod utils;
 
 // Re-export common types for convenience

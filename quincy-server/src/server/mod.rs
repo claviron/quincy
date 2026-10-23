@@ -91,6 +91,7 @@ pub struct QuincyServer {
     pools: Pools,
     session_registry: Arc<UserSessionRegistry>,
     observer: Option<Arc<dyn lifecycle::Observer>>,
+    tls: Option<quincy::tls::Identity>,
 }
 
 impl QuincyServer {
@@ -129,6 +130,7 @@ impl QuincyServer {
             pools,
             session_registry: Arc::new(UserSessionRegistry::new()),
             observer: None,
+            tls: None,
         })
     }
 
@@ -142,6 +144,20 @@ impl QuincyServer {
     pub fn with_observer(mut self, observer: Arc<dyn lifecycle::Observer>) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Select a host-owned server identity and public client trust before IO.
+    /// Every credential replacement uses these roots and its own fingerprint set.
+    pub fn with_tls_identity(mut self, identity: quincy::tls::Identity) -> Result<Self> {
+        self.config.as_quinn_server_config_with_tls(
+            &identity,
+            self.applied
+                .borrow()
+                .credentials()
+                .collect_cert_fingerprints(),
+        )?;
+        self.tls = Some(identity);
+        Ok(self)
     }
 
     /// Starts the standalone server with its ordinary process signal handler.
@@ -229,17 +245,20 @@ impl QuincyServer {
         ingress_queue: Sender<Packet>,
         shutdown: impl std::future::Future<Output = Result<()>>,
     ) -> Result<()> {
-        let mut admission = Arc::new(Admission::prepare(
-            &self.config,
-            self.applied.borrow().clone(),
-            &self.pools,
-        )?);
+        let identity = self.applied.borrow().clone();
+        let mut admission = Arc::new(match self.tls.as_ref() {
+            Some(tls) => {
+                Admission::prepare_with_tls(&self.config, identity, &self.pools, Some(tls))?
+            }
+            None => Admission::prepare(&self.config, identity, &self.pools)?,
+        });
         let endpoint = self.create_quinn_endpoint(&admission)?;
         let mut updates = Updates::new(
             self.identities.clone(),
             self.config.clone(),
             self.pools.clone(),
         );
+        updates.tls = self.tls.clone();
 
         info!(
             "Starting connection handler: {}",

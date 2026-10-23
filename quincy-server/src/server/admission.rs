@@ -29,6 +29,15 @@ impl Admission {
         identity: Arc<IdentitySnapshot>,
         pools: &Pools,
     ) -> Result<Self> {
+        Self::prepare_with_tls(config, identity, pools, None)
+    }
+
+    pub fn prepare_with_tls(
+        config: &ServerConfig,
+        identity: Arc<IdentitySnapshot>,
+        pools: &Pools,
+        tls: Option<&quincy::tls::Identity>,
+    ) -> Result<Self> {
         // Allocation ownership never moves when credentials are replaced. An
         // absent user leaves their pool reserved, including any active leases.
         for (name, entry) in identity.users() {
@@ -59,7 +68,12 @@ impl Admission {
             ServerProtocolConfig::Tls(_) => (None, Some(users.collect_cert_fingerprints())),
         };
         Ok(Self {
-            transport: Arc::new(config.as_quinn_server_config(keys, fingerprints)?),
+            transport: Arc::new(match tls {
+                Some(tls) => {
+                    config.as_quinn_server_config_with_tls(tls, fingerprints.unwrap_or_default())?
+                }
+                None => config.as_quinn_server_config(keys, fingerprints)?,
+            }),
             identity,
         })
     }
@@ -73,6 +87,7 @@ pub(super) struct Updates {
     open: bool,
     config: ServerConfig,
     pools: Pools,
+    pub(super) tls: Option<quincy::tls::Identity>,
 }
 
 impl Updates {
@@ -87,6 +102,7 @@ impl Updates {
             open: true,
             config,
             pools,
+            tls: None,
         }
     }
 
@@ -103,8 +119,10 @@ impl Updates {
             let identity = self.snapshots.borrow_and_update().clone();
             let config = self.config.clone();
             let pools = self.pools.clone();
-            self.task = Some(tokio::task::spawn_blocking(move || {
-                Admission::prepare(&config, identity, &pools)
+            let tls = self.tls.clone();
+            self.task = Some(tokio::task::spawn_blocking(move || match tls.as_ref() {
+                Some(tls) => Admission::prepare_with_tls(&config, identity, &pools, Some(tls)),
+                None => Admission::prepare(&config, identity, &pools),
             }));
         }
         let result = self.task.as_mut().expect("preparation started").await;

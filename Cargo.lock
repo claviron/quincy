@@ -4009,6 +4009,7 @@ dependencies = [
  "quincy-tun",
  "quinn",
  "rand_core 0.6.4",
+ "rcgen",
  "reishi-quinn",
  "rustls",
  "rustls-pemfile",
